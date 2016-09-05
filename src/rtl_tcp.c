@@ -37,6 +37,9 @@
 #include "getopt/getopt.h"
 #endif
 
+#ifdef NEED_PTHREADS_WORKARROUND
+#define HAVE_STRUCT_TIMESPEC
+#endif
 #include <pthread.h>
 
 #include "rtl-sdr.h"
@@ -79,6 +82,7 @@ typedef struct { /* structure size must be multiple of 2 bytes */
 static rtlsdr_dev_t *dev = NULL;
 
 static int verbosity = 0;
+static int enable_biastee = 0;
 static uint32_t bandwidth = 0;
 static int global_numq = 0;
 static struct llist *ll_buffers = 0;
@@ -91,15 +95,20 @@ void usage(void)
 	printf("rtl_tcp, an I/Q spectrum server for RTL2832 based DVB-T receivers\n\n"
 		"Usage:\t[-a listen address]\n"
 		"\t[-p listen port (default: 1234)]\n"
+		"\t[-I infrared sensor listen port (default: 0=none)]\n"
+		"\t[-W infrared sensor query wait interval usec (default: 10000)]\n"
 		"\t[-f frequency to tune to [Hz]]\n"
 		"\t[-g gain in dB (default: 0 for auto)]\n"
 		"\t[-s samplerate in Hz (default: 2048000 Hz)]\n"
 		"\t[-b number of buffers (default: 15, set by library)]\n"
-		"\t[-l length of single buffer in units of 512 samples (default: 64 was 256)]\n"
+		"\t[-l length of single buffer in units of 512 samples (default: 32 was 256)]\n"
 		"\t[-n max number of linked list buffers to keep (default: 500)]\n"
 		"\t[-w rtlsdr tuner bandwidth [Hz] (for R820T and E4000 tuners)]\n"
 		"\t[-d device index (default: 0)]\n"
 		"\t[-P ppm_error (default: 0)]\n"
+		"\t[-T enable bias-T on GPIO PIN 0 (works for rtl-sdr.com v3 dongles)]\n"
+		"\t[-D direct_sampling_mode (default: 0, 1 = I, 2 = Q, 3 = I below threshold, 4 = Q below threshold)]\n"
+		"\t[-D direct_sampling_threshold_frequency (default: 0 use tuner specific frequency threshold for 3 and 4)]\n"
 		"\t[-v increase verbosity (default: 0)]\n");
 	exit(1);
 }
@@ -371,6 +380,10 @@ static void *command_worker(void *arg)
 			printf("set tuner bandwidth to %i Hz\n", bandwidth);
 			verbose_set_bandwidth(dev, bandwidth);
 			break;
+		case SET_BIAS_TEE:
+			printf("setting bias-t to %d\n", ntohl(cmd.param));
+			rtlsdr_set_bias_tee(dev, ntohl(cmd.param));
+			break;
 		default:
 			break;
 		}
@@ -378,24 +391,103 @@ static void *command_worker(void *arg)
 	}
 }
 
+struct ir_thread_data
+{
+	rtlsdr_dev_t *dev;
+	SOCKET port;
+	int wait;
+	char *addr;
+};
+
+void *ir_thread_fn(void *arg)
+{
+	int r = 1;
+	struct linger ling = {1,0};
+	SOCKET listensocket;
+	SOCKET irsocket;
+	struct sockaddr_in local, remote;
+	socklen_t rlen;
+	uint8_t buf[128];
+	int ret = 0, len;
+
+	struct ir_thread_data *data = (struct ir_thread_data *)arg;
+
+	rtlsdr_dev_t *dev = data->dev;
+	int port = data->port;
+	int wait = data->wait;
+	char *addr = data->addr;
+
+
+	memset(&local,0,sizeof(local));
+	local.sin_family = AF_INET;
+	local.sin_port = htons(port);
+	local.sin_addr.s_addr = inet_addr(addr);
+
+	listensocket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+	r = 1;
+	setsockopt(listensocket, SOL_SOCKET, SO_REUSEADDR, (char *)&r, sizeof(int));
+	setsockopt(listensocket, SOL_SOCKET, SO_LINGER, (char *)&ling, sizeof(ling));
+	bind(listensocket,(struct sockaddr *)&local,sizeof(local));
+
+
+	while(1) {
+		printf("listening on IR port %d...\n", port);
+		listen(listensocket,1);
+
+		irsocket = accept(listensocket,(struct sockaddr *)&remote, &rlen);
+		setsockopt(irsocket, SOL_SOCKET, SO_LINGER, (char *)&ling, sizeof(ling));
+
+		printf("IR client accepted!\n");
+
+		while(1) {
+		    ret = rtlsdr_ir_query(dev, buf, sizeof(buf));
+		    if (ret < 0) {
+			printf("rtlsdr_ir_query error %d\n", ret);
+			break;
+		    }
+
+		    len = ret;
+
+		    ret = send(irsocket, buf, len, 0);
+		    if (ret != len){
+			printf("incomplete write to ir client: %d != %d\n", ret,len);
+			break;
+		    }
+
+		    usleep(wait);
+		}
+
+		closesocket(irsocket);
+	}
+
+	return 0;
+}
+
 int main(int argc, char **argv)
 {
 	int r, opt, i;
 	char* addr = "127.0.0.1";
 	int port = 1234;
+	int port_ir = 0;
+	int wait_ir = 10000;
+	pthread_t thread_ir;
 	uint32_t frequency = 100000000, samp_rate = 2048000;
+	enum rtlsdr_ds_mode ds_mode = RTLSDR_DS_IQ;
+	uint32_t ds_temp, ds_threshold = 0;
 	struct sockaddr_in local, remote;
 	uint32_t buf_num = 0;
 	/* buf_len:
-	 * -> 256 -> 262 ms @ 250 kS  or  20.48 ms @ 3.2 MS (internal default)
-	 * -> 128 -> 131 ms @ 250 kS  or  10.24 ms @ 3.2 MS
-	 * ->  64 ->  65 ms @ 250 kS  or   5.12 ms @ 3.2 MS (new default)
+	 * must be multiple of 512 - else it will be overwritten
+	 * in rtlsdr_read_async() in librtlsdr.c with DEFAULT_BUF_LENGTH (= 16*32 *512 = 512 *512)
+	 *
+	 * -> 512*512 -> 1048 ms @ 250 kS  or  81.92 ms @ 3.2 MS (internal default)
+	 * ->  32*512 ->   65 ms @ 250 kS  or   5.12 ms @ 3.2 MS (new default)
 	 *
 	 * usual soundcard as reference:
 	 *   512 samples @ 48 kHz ~= 10.6 ms
 	 *   512 samples @  8 kHz  = 64 ms
 	 */
-	uint32_t buf_len = 64;
+	uint32_t buf_len = 32 * 512;
 	int dev_index = 0;
 	int dev_given = 0;
 	int gain = 0;
@@ -418,7 +510,7 @@ int main(int argc, char **argv)
 	struct sigaction sigact, sigign;
 #endif
 
-	while ((opt = getopt(argc, argv, "a:p:f:g:s:b:l:n:d:P:w:v")) != -1) {
+	while ((opt = getopt(argc, argv, "a:p:I:W:f:g:s:b:l:n:d:P:w:D:vT")) != -1) {
 		switch (opt) {
 		case 'd':
 			dev_index = verbose_device_search(optarg);
@@ -439,6 +531,12 @@ int main(int argc, char **argv)
 		case 'p':
 			port = atoi(optarg);
 			break;
+		case 'I':
+			port_ir = atoi(optarg);
+			break;
+		case 'W':
+			wait_ir = atoi(optarg);
+			break;
 		case 'b':
 			buf_num = atoi(optarg);
 			break;
@@ -456,6 +554,16 @@ int main(int argc, char **argv)
 			break;
 		case 'v':
 			++verbosity;
+			break;
+		case 'T':
+			enable_biastee = 1;
+			break;
+		case 'D':
+			ds_temp = (uint32_t)( atofs(optarg) + 0.5 );
+			if (ds_temp <= RTLSDR_DS_Q_BELOW)
+				ds_mode = (enum rtlsdr_ds_mode)ds_temp;
+			else
+				ds_threshold = ds_temp;
 			break;
 		default:
 			usage();
@@ -504,6 +612,9 @@ int main(int argc, char **argv)
 	if (r < 0)
 		fprintf(stderr, "WARNING: Failed to set sample rate.\n");
 
+	/* Set direct sampling with threshold */
+	rtlsdr_set_ds_mode(dev, ds_mode, ds_threshold);
+
 	/* Set the frequency */
 	r = rtlsdr_set_center_freq(dev, frequency);
 	if (r < 0)
@@ -532,6 +643,10 @@ int main(int argc, char **argv)
 
 	verbose_set_bandwidth(dev, bandwidth);
 
+	rtlsdr_set_bias_tee(dev, enable_biastee);
+	if (enable_biastee)
+		fprintf(stderr, "activated bias-T on GPIO PIN 0\n");
+
 	/* Reset endpoint before we start reading from it (mandatory) */
 	r = rtlsdr_reset_buffer(dev);
 	if (r < 0)
@@ -542,6 +657,13 @@ int main(int argc, char **argv)
 	pthread_mutex_init(&exit_cond_lock, NULL);
 	pthread_cond_init(&cond, NULL);
 	pthread_cond_init(&exit_cond, NULL);
+
+	if (port_ir) {
+		struct ir_thread_data data = {.dev = dev, .port = port_ir, .wait = wait_ir, .addr = addr};
+
+		pthread_create(&thread_ir, NULL, &ir_thread_fn, (void *)(&data));
+	}
+
 
 	memset(&local,0,sizeof(local));
 	local.sin_family = AF_INET;
@@ -642,6 +764,7 @@ int main(int argc, char **argv)
 out:
 	rtlsdr_close(dev);
 	closesocket(listensocket);
+	//if (port_ir) pthread_join(thread_ir, &status);
 	closesocket(s);
 #ifdef _WIN32
 	WSACleanup();
