@@ -2327,6 +2327,7 @@ int rtlsdr_set_ds_mode(rtlsdr_dev_t *dev, enum rtlsdr_ds_mode mode, uint32_t fre
 
 static int rtlsdr_update_ds(rtlsdr_dev_t *dev, uint64_t freq)
 {
+	dev->freq = freq;
 	int new_ds = 0;
 	int curr_ds = rtlsdr_get_direct_sampling(dev);
 	if ( curr_ds < 0 )
