@@ -447,7 +447,6 @@ int r820t_set_bw(void *dev, int bw, uint32_t *applied_bw, int apply) {
 			fprintf(stderr, "r820t_set_bw(%d): rtlsdr_set_if_freq(%d) returned error %d\n", bw, iffreq, r);
 		return r;
 	}
-
 	r = rtlsdr_set_center_freq(devt, devt->freq);
 	if ( r && devt->verbose )
 		fprintf(stderr, "r820t_set_bw(%d): rtlsdr_set_center_freq(%d) returned error %d\n", bw, devt->freq, r);
@@ -2203,13 +2202,16 @@ int rtlsdr_set_direct_sampling(rtlsdr_dev_t *dev, int on)
 
 		/* opt_adc_iq = 0, default ADC_I/ADC_Q datapath */
 		r |= rtlsdr_demod_write_reg(dev, 0, 0x06, 0x80, 1);
-
+		
 		fprintf(stderr, "Disabled direct sampling mode\n");
 		dev->direct_sampling = 0;
+		
+		r |= rtlsdr_set_tuner_bandwidth(dev, dev->bw);
+		r |= rtlsdr_set_center_freq(dev, dev->freq);
+		//r |= rtlsdr_set_tuner_gain_mode(dev, 0);
+		//r |= rtlsdr_set_agc_mode(dev, 1);
 	}
-
-	r |= rtlsdr_set_center_freq(dev, dev->freq);
-
+	
 	return r;
 }
 
@@ -2267,6 +2269,7 @@ int rtlsdr_set_ds_mode(rtlsdr_dev_t *dev, enum rtlsdr_ds_mode mode, uint32_t fre
 
 static int rtlsdr_update_ds(rtlsdr_dev_t *dev, uint32_t freq)
 {
+	dev->freq = freq;
 	int new_ds = 0;
 	int curr_ds = rtlsdr_get_direct_sampling(dev);
 	if ( curr_ds < 0 )
@@ -2281,9 +2284,8 @@ static int rtlsdr_update_ds(rtlsdr_dev_t *dev, uint32_t freq)
 	case RTLSDR_DS_Q_BELOW:	new_ds = (freq < dev->direct_sampling_threshold) ? 2 : 0; break;
 	}
 
-	//if ( dev->verbose )
-	//	fprintf(stderr, "rtlsdr_update_ds(%u Hz) --> ds = %d for mode %s\n",
-	//		freq, new_ds, dsmode_str[dev->direct_sampling_mode] );
+	if ( dev->verbose )
+		fprintf(stderr, "rtlsdr_update_ds(%u Hz) --> ds = %d for mode %s\n", freq, new_ds, dsmode_str[dev->direct_sampling_mode] );
 
 	if ( curr_ds != new_ds )
 		return rtlsdr_set_direct_sampling(dev, new_ds);
