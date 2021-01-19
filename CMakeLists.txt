@@ -127,6 +127,10 @@ endif()
 ########################################################################
 # Setup the include and linker paths
 ########################################################################
+set(RTL_RUNTIME_DIR   bin)
+set(RTL_LIBRARY_DIR   lib${LIB_SUFFIX})
+set(RTL_INCLUDE_DIR   include)
+
 include_directories(
     ${CMAKE_SOURCE_DIR}/include
     ${LIBUSB_INCLUDE_DIR}
@@ -140,6 +144,27 @@ include_directories(
 
 # Set component parameters
 #set(INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/include CACHE INTERNAL "" FORCE)
+
+
+########################################################################
+# On Apple only, set install name and use rpath correctly, if not already set
+########################################################################
+if(APPLE)
+    if(NOT CMAKE_INSTALL_NAME_DIR)
+        set(CMAKE_INSTALL_NAME_DIR
+            ${CMAKE_INSTALL_PREFIX}/${RTL_LIBRARY_DIR} CACHE
+            PATH "Library Install Name Destination Directory" FORCE)
+    endif(NOT CMAKE_INSTALL_NAME_DIR)
+    if(NOT CMAKE_INSTALL_RPATH)
+        set(CMAKE_INSTALL_RPATH
+            ${CMAKE_INSTALL_PREFIX}/${RTL_LIBRARY_DIR} CACHE
+            PATH "Library Install RPath" FORCE)
+    endif(NOT CMAKE_INSTALL_RPATH)
+    if(NOT CMAKE_BUILD_WITH_INSTALL_RPATH)
+        set(CMAKE_BUILD_WITH_INSTALL_RPATH ON CACHE
+            BOOL "Do Build Using Library Install RPath" FORCE)
+    endif(NOT CMAKE_BUILD_WITH_INSTALL_RPATH)
+endif(APPLE)
 
 ########################################################################
 # Create uninstall target
